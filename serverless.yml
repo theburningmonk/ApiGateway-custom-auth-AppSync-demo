@@ -1,0 +1,117 @@
+service: apigateway-custom-auth-appsync-demo
+
+plugins:
+  - serverless-appsync-plugin
+  - serverless-pseudo-parameters
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+functions:
+  authorizer:
+    handler: authorizer.handler
+    environment:
+      ACCOUNT_ID: "#{AWS::AccountId}"
+      REGION: "#{AWS::Region}"
+      API_ID: !Ref ApiGatewayRestApi
+
+  # need at least one HTTP function to make SLS generate the necessary
+  # ApiGatewayRestApi and (the randomly named) AWS::ApiGateway::Deployment resource
+  info:
+    handler: /info.handler
+    events:
+      - http:
+          path: /info
+          method: get
+
+custom:
+  stage: ${opt:stage, self:provider.stage}
+  appSync:
+    authenticationType: AWS_IAM
+    mappingTemplates:
+      - dataSource: none
+        type: Query
+        field: theAnswer
+    dataSources:
+      - type: NONE
+        name: none
+
+resources:
+  Resources:
+    ApiGatewayToAppSyncRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: apigateway.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: ApiGatewayToAppSync
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: appsync:GraphQL
+                  Resource:
+                    - !Ref GraphQlApi
+                    - "#{GraphQlApi}/*"
+
+    LambdaAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties: 
+        AuthorizerUri: arn:aws:apigateway:#{AWS::Region}:lambda:path/2015-03-31/functions/#{AuthorizerLambdaFunction.Arn}/invocations
+        IdentitySource: method.request.header.MyAuthToken
+        Name: String
+        RestApiId: !Ref ApiGatewayRestApi
+        Type: TOKEN
+
+    LambdaAuthorizerPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt AuthorizerLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: apigateway.amazonaws.com
+        SourceArn: arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:#{ApiGatewayRestApi}/*/*
+
+    ApiGatewayMethodGet:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: POST
+        RequestParameters: {}
+        ResourceId: !GetAtt ApiGatewayRestApi.RootResourceId
+        RestApiId: !Ref ApiGatewayRestApi
+        ApiKeyRequired: false
+        AuthorizationType: CUSTOM
+        AuthorizerId: !Ref LambdaAuthorizer
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: POST
+          Credentials: !GetAtt ApiGatewayToAppSyncRole.Arn
+          # uri needs to be arn:aws:apigateway:#{AWS::Region}:{the url prefix}.appsync-api:path/graphql
+          Uri: #arn:aws:apigateway:#{AWS::Region}:oyuhw576jjf3jfc6cbp5iq7r5y.appsync-api:path/graphql
+            !Join ['', [
+              'arn:aws:apigateway:#{AWS::Region}:',
+              # for example, url is https://oyuhw576jjf3jfc6cbp5iq7r5y.appsync-api.us-east-1.amazonaws.com/graphql
+              # split by 'https://' => [ '', 'oyuhw576jjf3jfc6cbp5iq7r5y.appsync-api.us-east-1.amazonaws.com/graphql' ]
+              # then select index 1 => 'oyuhw576jjf3jfc6cbp5iq7r5y.appsync-api.us-east-1.amazonaws.com/graphql'
+              # then split by '.' => ['oyuhw576jjf3jfc6cbp5iq7r5y', 'appsync-api', 'us-east-1', 'amazonaws' 'com/graphql']
+              # then select index 0 => 'oyuhw576jjf3jfc6cbp5iq7r5y' 
+              # thanks AWS, this is way more difficult than it should be...
+              !Select [ 0, !Split [ '.', !Select [ 1, !Split [ 'https://', !GetAtt GraphQlApi.GraphQLUrl] ] ] ],  
+              .appsync-api:path/graphql
+            ]]
+          IntegrationResponses:
+            - StatusCode: "200"
+              SelectionPattern: "2\\d{2}"
+            - StatusCode: "401"
+              SelectionPattern: "4\\d{2}"
+            - StatusCode: "502"
+              SelectionPattern: "5\\d{2}"
+        MethodResponses:
+          - StatusCode: "200"
+          - StatusCode: "401"
+          - StatusCode: "502"
